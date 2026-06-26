@@ -1,31 +1,28 @@
-"""FastMCP сервер. Регистрирует инструменты для Claude Code.
+"""FastMCP сервер. Оборачивает external API Agent Zero в инструменты для Claude Code.
+
+API синхронный: a0_run отправляет сообщение и сразу возвращает финальный ответ субагента.
+Параллельный fan-out достигается параллельными вызовами a0_run из Claude Code — каждый
+блокируется до своего ответа независимо.
 
 Инструменты:
-  a0_run          — отправить задачу субагенту, вернуть context_id (не ждать)
-  a0_wait         — дождаться завершения задачи и вернуть финальный ответ (+ streaming прогресса)
-  a0_status       — получить текущее состояние без ожидания (для poll)
-  a0_log_tail     — последние N строк лога (для отладки)
-  a0_projects     — список проектов
-  a0_presets      — список model presets
-  a0_schedule     — управление cron/planned задачами планировщика Agent Zero
-  a0_reset        — сбросить историю чата
-  a0_terminate    — остановить чат
-  a0_health       — проверка связности с Agent Zero
+  a0_health     — проверка связности и валидности ключа
+  a0_run        — отправить сообщение субагенту, синхронно вернуть ответ (+ context_id)
+  a0_log_tail   — последние N записей лога чата (для отладки/инспекции)
+  a0_reset      — сбросить историю чата (context_id остаётся)
+  a0_terminate  — удалить чат
+  a0_files_get  — получить файлы из workspace субагента (base64)
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
-from .adapters import BaseAdapter, make_adapter
-from .client import A0Client, A0HTTPError
+from .client import A0Client
 from .config import settings
 
 log = logging.getLogger(__name__)
@@ -35,8 +32,6 @@ def _csv(raw: str) -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
-# DNS-rebinding защита MCP-транспорта. Если выключена — Host/Origin не валидируются
-# (нужно для доступа по LAN-адресу, иначе SDK отдаёт 421 Misdirected Request).
 _transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=settings.mcp_dns_rebinding_protection,
     allowed_hosts=_csv(settings.mcp_allowed_hosts),
@@ -46,95 +41,44 @@ _transport_security = TransportSecuritySettings(
 mcp = FastMCP(
     name="a0-mcp",
     instructions=(
-        "Wrapper around Agent Zero. Use a0_run to delegate work to a subordinate agent, "
-        "then a0_wait or a0_status to retrieve the result. a0_wait also streams live progress "
-        "while the subagent works. Each subagent maintains its own context, so multiple a0_run "
-        "calls in parallel give you isolated workers. Use project_id to scope the workspace and "
-        "preset to switch model configuration. Use a0_schedule for recurring (cron) or one-off "
-        "background tasks."
+        "Wrapper around Agent Zero's external API. Use a0_run to delegate a task to a subordinate "
+        "agent and get its final answer synchronously. Pass context_id to continue an existing chat, "
+        "or project_name (first message only) to scope the workspace. Run several a0_run calls in "
+        "parallel to fan out isolated subagents. Use a0_log_tail to inspect what a subagent did, "
+        "a0_files_get to pull files it produced, and a0_terminate to clean up."
     ),
     transport_security=_transport_security,
 )
 
 
-# --- Глобальный shared client + adapter (живут весь lifespan сервера) ---
+# --- Глобальный shared client (живёт весь lifespan сервера) ---
 _client: A0Client | None = None
-_adapter: BaseAdapter | None = None
 
 
-def _adapter_ref() -> BaseAdapter:
-    """Lazy инициализация. Используем при первом вызове любого tool."""
-    global _client, _adapter
-    if _adapter is None:
+def _client_ref() -> A0Client:
+    global _client
+    if _client is None:
         _client = A0Client()
-        _adapter = make_adapter(_client)
-        log.info(
-            "Connected to Agent Zero %s at %s (adapter=%s)",
-            settings.a0_version,
-            settings.a0_url,
-            _adapter.version_label,
-        )
-    return _adapter
+        log.info("Connected to Agent Zero at %s", settings.a0_url)
+    return _client
 
 
-def _resolve_project(project_id: str | None) -> str | None:
-    """Если пользователь не указал project_id, используем default из конфига."""
-    return project_id or (settings.a0_default_project or None)
+def _resolve_project(project_name: str | None) -> str | None:
+    return project_name or (settings.a0_default_project or None)
 
 
-def _extract_context_id(resp: dict[str, Any]) -> str:
-    """Поддерживаем разные имена поля между версиями."""
+def _extract_context_id(resp: dict[str, Any]) -> str | None:
     for key in ("context_id", "context", "ctx_id", "chat_id"):
-        v = resp.get(key)
-        if v:
-            return str(v)
-    raise A0HTTPError(f"Agent Zero не вернул context_id, ответ: {resp}")
+        if resp.get(key):
+            return str(resp[key])
+    return None
 
 
-def _log_obj(log_resp: dict[str, Any]) -> dict[str, Any]:
-    """Достаём тело лога (некоторые версии оборачивают в ключ 'log')."""
-    return log_resp.get("log") or log_resp
-
-
-def _log_items(log_resp: dict[str, Any]) -> list[dict[str, Any]]:
-    return _log_obj(log_resp).get("items") or []
-
-
-def _is_finished(log_resp: dict[str, Any]) -> bool:
-    """Эвристика: считаем чат завершённым, если progress=done или последний item имеет финальный type."""
-    log_obj = _log_obj(log_resp)
-    progress = (log_obj.get("progress") or "").lower()
-    if progress in {"done", "finished", "complete", "completed"}:
-        return True
-
-    items = log_obj.get("items") or []
-    if not items:
-        return False
-    last = items[-1]
-    last_type = (last.get("type") or "").lower()
-    return last_type in {"response", "result", "final", "answer", "done"}
-
-
-def _final_text(log_resp: dict[str, Any]) -> str:
-    """Достаём финальный текст из последнего assistant-сообщения."""
-    items = _log_items(log_resp)
-    for item in reversed(items):
-        t = (item.get("type") or "").lower()
-        if t in {"response", "result", "final", "answer"}:
-            content = item.get("content") or item.get("text") or item.get("kvps", {}).get("text")
-            if content:
-                return str(content)
-    # Фоллбек — последний item целиком
-    return str(items[-1]) if items else "(пустой лог)"
-
-
-def _item_brief(item: dict[str, Any]) -> str:
-    """Короткая человекочитаемая строка про один шаг лога — для streaming в Claude Code."""
-    t = item.get("type") or "?"
-    head = item.get("heading") or item.get("kvps", {}).get("tool_name") or ""
-    body = item.get("content") or item.get("text") or item.get("kvps", {}).get("text") or ""
-    line = " ".join(str(x) for x in (f"[{t}]", head, body) if x).strip()
-    return line[:240]
+def _extract_response(resp: dict[str, Any]) -> str:
+    for key in ("response", "answer", "result", "text"):
+        if resp.get(key):
+            return str(resp[key])
+    return ""
 
 
 # ============================================================================
@@ -144,255 +88,79 @@ def _item_brief(item: dict[str, Any]) -> str:
 
 @mcp.tool()
 async def a0_health() -> dict[str, Any]:
-    """Проверить связность с Agent Zero. Возвращает версию и базовую информацию."""
-    adapter = _adapter_ref()
-    return {
-        "configured_version": settings.a0_version,
-        "adapter": adapter.version_label,
-        "a0_url": settings.a0_url,
-        **(await adapter.health()),
-    }
+    """Проверить связность с Agent Zero и валидность API-ключа."""
+    return {"a0_url": settings.a0_url, **(await _client_ref().health())}
 
 
 @mcp.tool()
 async def a0_run(
-    prompt: Annotated[str, Field(description="Задача субагенту, на естественном языке")],
-    project_id: Annotated[
-        str | None,
-        Field(default=None, description="ID проекта Agent Zero. Изолирует workspace, memory, secrets."),
-    ] = None,
-    preset: Annotated[
-        str | None,
-        Field(default=None, description="Имя model preset (например 'fast', 'balanced', 'best')."),
-    ] = None,
+    message: Annotated[str, Field(description="Задача субагенту, на естественном языке")],
     context_id: Annotated[
         str | None,
-        Field(default=None, description="Если задан — продолжить существующий чат, иначе создать новый."),
+        Field(default=None, description="Продолжить существующий чат. Пусто — создать новый."),
     ] = None,
-) -> dict[str, Any]:
-    """Отправить задачу субагенту Agent Zero. Возвращает context_id мгновенно (async режим).
-
-    Дальше используйте a0_wait для блокирующего ожидания (со стримингом прогресса)
-    или a0_status для poll. Несколько одновременных a0_run создают изолированных
-    параллельных субагентов.
-    """
-    adapter = _adapter_ref()
-    resp = await adapter.send_message(
-        prompt=prompt,
-        context_id=context_id,
-        project_id=_resolve_project(project_id),
-        preset=preset,
-        async_mode=True,
-    )
-    ctx = _extract_context_id(resp) if not context_id else context_id
-    return {"context_id": ctx, "started": True, "raw": resp}
-
-
-@mcp.tool()
-async def a0_wait(
-    context_id: Annotated[str, Field(description="Context ID из a0_run")],
-    ctx: Context,
-    timeout: Annotated[
+    project_name: Annotated[
+        str | None,
+        Field(default=None, description="Проект A0 (workspace/memory). Активируется только на первом сообщении."),
+    ] = None,
+    lifetime_hours: Annotated[
         float | None,
-        Field(default=None, description="Макс. ожидание в секундах. По умолчанию из конфига."),
+        Field(default=None, description="Время жизни чата в часах (по умолчанию из конфига)."),
     ] = None,
 ) -> dict[str, Any]:
-    """Дождаться завершения задачи и вернуть финальный ответ субагента.
+    """Отправить задачу субагенту Agent Zero и синхронно получить финальный ответ.
 
-    Внутри делает polling /api_log_get с интервалом из A0_WAIT_POLL_INTERVAL и
-    параллельно стримит прогресс в Claude Code: каждую новую запись лога субагента
-    пушит как log-сообщение, а долю прошедшего времени — как progress notification.
+    API блокирующий: возврат происходит, когда субагент закончил. Для параллельной работы
+    делайте несколько вызовов a0_run в одном ответе — каждый создаёт изолированный субагент.
+    Сохраните context_id из ответа, чтобы продолжить тот же чат следующим a0_run.
     """
-    adapter = _adapter_ref()
-    total = timeout or settings.a0_wait_timeout
-    start = time.monotonic()
-    deadline = start + total
-    seen = 0
-    last: dict[str, Any] = {}
-
-    while time.monotonic() < deadline:
-        last = await adapter.get_log(context_id, length=200)
-        items = _log_items(last)
-
-        # --- streaming: пушим новые шаги субагента и долю прогресса ---
-        for item in items[seen:]:
-            brief = _item_brief(item)
-            if brief:
-                await _safe_log(ctx, brief)
-        seen = len(items)
-        await _safe_progress(ctx, progress=time.monotonic() - start, total=total)
-
-        if _is_finished(last):
-            await _safe_progress(ctx, progress=total, total=total)
-            await _safe_log(ctx, "subagent finished")
-            return {
-                "context_id": context_id,
-                "status": "done",
-                "result": _final_text(last),
-                "log": last,
-            }
-        await asyncio.sleep(settings.a0_wait_poll_interval)
-
+    resp = await _client_ref().send_message(
+        message,
+        context_id=context_id,
+        project_name=_resolve_project(project_name),
+        lifetime_hours=lifetime_hours,
+    )
     return {
-        "context_id": context_id,
-        "status": "timeout",
-        "partial": _final_text(last) if last else None,
-        "log": last,
-    }
-
-
-async def _safe_log(ctx: Context, message: str) -> None:
-    """Отправить log-сообщение клиенту, не падая если канал недоступен."""
-    try:
-        await ctx.info(message)
-    except Exception:  # noqa: BLE001 — streaming не должен ломать основную работу
-        log.debug("ctx.info failed, message dropped: %s", message)
-
-
-async def _safe_progress(ctx: Context, *, progress: float, total: float) -> None:
-    """Отправить progress notification; no-op если клиент не передал progressToken."""
-    try:
-        await ctx.report_progress(progress=progress, total=total)
-    except Exception:  # noqa: BLE001
-        log.debug("ctx.report_progress failed (нет progressToken?)")
-
-
-@mcp.tool()
-async def a0_status(
-    context_id: Annotated[str, Field(description="Context ID из a0_run")],
-) -> dict[str, Any]:
-    """Не блокирующая проверка состояния задачи. Не ждёт завершения."""
-    adapter = _adapter_ref()
-    log_resp = await adapter.get_log(context_id, length=50)
-    finished = _is_finished(log_resp)
-    return {
-        "context_id": context_id,
-        "status": "done" if finished else "running",
-        "result": _final_text(log_resp) if finished else None,
-        "progress": _log_obj(log_resp).get("progress"),
+        "context_id": _extract_context_id(resp) or context_id,
+        "response": _extract_response(resp),
+        "raw": resp,
     }
 
 
 @mcp.tool()
 async def a0_log_tail(
-    context_id: Annotated[str, Field(description="Context ID из a0_run")],
+    context_id: Annotated[str, Field(description="Context ID чата")],
     length: Annotated[int, Field(default=20, description="Кол-во последних записей")] = 20,
 ) -> dict[str, Any]:
-    """Последние N записей лога чата. Для отладки и понимания что делает субагент."""
-    adapter = _adapter_ref()
-    return await adapter.get_log(context_id, length=length)
-
-
-@mcp.tool()
-async def a0_projects() -> list[dict[str, Any]]:
-    """Список доступных проектов Agent Zero. Пустой список означает что endpoint недоступен —
-    используйте project_id напрямую как строку, как в WebUI."""
-    return await _adapter_ref().list_projects()
-
-
-@mcp.tool()
-async def a0_presets() -> list[dict[str, Any]]:
-    """Список model presets (Best, Balanced, Fast Cheap, Local, ...)."""
-    return await _adapter_ref().list_presets()
-
-
-@mcp.tool()
-async def a0_schedule(
-    action: Annotated[
-        Literal["create", "list", "delete", "run"],
-        Field(description="Что сделать: create / list / delete / run"),
-    ],
-    name: Annotated[
-        str | None,
-        Field(default=None, description="Имя задачи (для action=create)"),
-    ] = None,
-    prompt: Annotated[
-        str | None,
-        Field(default=None, description="Что должен выполнить субагент (для action=create)"),
-    ] = None,
-    schedule: Annotated[
-        str | None,
-        Field(
-            default=None,
-            description="Crontab '<m> <h> <dom> <mon> <dow>', напр. '0 9 * * 1-5' (для type=scheduled)",
-        ),
-    ] = None,
-    task_type: Annotated[
-        Literal["scheduled", "adhoc"],
-        Field(default="scheduled", description="scheduled — по cron; adhoc — разовая, запуск вручную"),
-    ] = "scheduled",
-    task_id: Annotated[
-        str | None,
-        Field(default=None, description="ID задачи (для action=delete / run)"),
-    ] = None,
-    system_prompt: Annotated[
-        str,
-        Field(default="", description="Доп. системный промпт для задачи"),
-    ] = "",
-    project_id: Annotated[
-        str | None,
-        Field(default=None, description="Проект, в котором выполнять задачу"),
-    ] = None,
-    dedicated_context: Annotated[
-        bool,
-        Field(default=False, description="Запускать в выделенном контексте (свежая память каждый раз)"),
-    ] = False,
-) -> dict[str, Any]:
-    """Управление планировщиком Agent Zero (Cron / Planned задачи).
-
-    Примеры:
-      a0_schedule(action="create", name="nightly-tests", prompt="прогони pytest и пришли отчёт",
-                  schedule="0 3 * * *")          — каждый день в 03:00
-      a0_schedule(action="list")                 — все задачи планировщика
-      a0_schedule(action="run", task_id="...")   — запустить немедленно
-      a0_schedule(action="delete", task_id="...")
-    """
-    adapter = _adapter_ref()
-
-    if action == "list":
-        return {"tasks": await adapter.list_schedules()}
-
-    if action == "create":
-        if not name or not prompt:
-            raise ValueError("Для action='create' обязательны name и prompt")
-        task = await adapter.create_schedule(
-            name=name,
-            prompt=prompt,
-            schedule=schedule,
-            system_prompt=system_prompt,
-            task_type=task_type,
-            project_id=_resolve_project(project_id),
-            dedicated_context=dedicated_context,
-        )
-        return {"created": True, "task": task}
-
-    if action == "run":
-        if not task_id:
-            raise ValueError("Для action='run' обязателен task_id")
-        return {"ran": True, "result": await adapter.run_schedule(task_id)}
-
-    if action == "delete":
-        if not task_id:
-            raise ValueError("Для action='delete' обязателен task_id")
-        return {"deleted": True, "result": await adapter.delete_schedule(task_id)}
-
-    raise ValueError(f"Неизвестный action: {action}")
+    """Последние N записей лога чата. Для отладки и понимания, что делал субагент."""
+    return await _client_ref().get_log(context_id, length=length)
 
 
 @mcp.tool()
 async def a0_reset(
     context_id: Annotated[str, Field(description="Context ID для сброса")],
 ) -> dict[str, Any]:
-    """Сбросить историю чата (контекст остаётся, начинаем заново)."""
-    return await _adapter_ref().reset_chat(context_id)
+    """Сбросить историю чата (context_id остаётся живым, начинаем заново)."""
+    return await _client_ref().reset_chat(context_id)
 
 
 @mcp.tool()
 async def a0_terminate(
-    context_id: Annotated[str, Field(description="Context ID для остановки")],
+    context_id: Annotated[str, Field(description="Context ID для удаления")],
 ) -> dict[str, Any]:
-    """Остановить чат полностью (удаление контекста). Используйте после завершения работы."""
-    return await _adapter_ref().terminate_chat(context_id)
+    """Удалить чат и освободить ресурсы. Используйте после завершения работы с субагентом."""
+    return await _client_ref().terminate_chat(context_id)
+
+
+@mcp.tool()
+async def a0_files_get(
+    paths: Annotated[
+        list[str],
+        Field(description="Пути к файлам в A0, напр. ['/a0/usr/uploads/report.txt']"),
+    ],
+) -> dict[str, Any]:
+    """Получить файлы из workspace Agent Zero. Возвращает {filename: base64}."""
+    return await _client_ref().get_files(paths)
 
 
 def run_streamable_http() -> None:
@@ -402,12 +170,10 @@ def run_streamable_http() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # FastMCP в свежих версиях знает про streamable_http_app(). Получаем ASGI app и запускаем uvicorn.
     import uvicorn
 
     app = mcp.streamable_http_app()
 
-    # Опциональный middleware для проверки bearer токена
     if settings.mcp_auth_token:
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse

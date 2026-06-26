@@ -1,7 +1,6 @@
 services:
   # --- Agent Zero ---
-  # По умолчанию v2.0. Для v1.x замените image на frdel/agent-zero:latest
-  # и в .env поставьте A0_VERSION=v1
+  # Если A0 уже запущен отдельно — удалите этот сервис и пропишите его адрес в A0_URL.
   agent-zero:
     image: agent0ai/agent-zero:latest
     container_name: a0
@@ -26,9 +25,8 @@ services:
       - "8765:8765"  # MCP endpoint: http://localhost:8765/mcp
     env_file:
       - .env
-    environment:
-      # Внутри docker network достаём по имени сервиса
-      - A0_URL=http://agent-zero:80
+    # A0_URL берётся из .env. Внутри docker network — http://agent-zero:80;
+    # если A0 снаружи, укажите его адрес с портом external API прямо в .env.
     networks:
       - a0net
 

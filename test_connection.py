@@ -44,22 +44,16 @@ except ImportError:  # pragma: no cover
 EXPECTED_TOOLS = {
     "a0_health",
     "a0_run",
-    "a0_wait",
-    "a0_status",
     "a0_log_tail",
-    "a0_projects",
-    "a0_presets",
-    "a0_schedule",
     "a0_reset",
     "a0_terminate",
+    "a0_files_get",
 }
 
-# Read-only вызовы: (имя, аргументы). Безопасны — ничего не меняют в Agent Zero.
+# Read-only вызовы: (имя, аргументы). Безопасны — ничего не создают в Agent Zero.
+# a0_run создаёт чат, поэтому он только в --full. a0_log_tail требует context_id (тоже в --full).
 READONLY_CALLS: list[tuple[str, dict[str, Any]]] = [
     ("a0_health", {}),
-    ("a0_projects", {}),
-    ("a0_presets", {}),
-    ("a0_schedule", {"action": "list"}),
 ]
 
 
@@ -138,23 +132,24 @@ async def run(url: str, token: str | None, full: bool, strict: bool) -> int:
 
 
 async def _full_roundtrip(session: ClientSession) -> int:
-    """a0_run -> a0_wait -> a0_terminate. Возвращает кол-во soft-провалов."""
+    """a0_run -> a0_log_tail -> a0_terminate. Возвращает кол-во soft-провалов."""
     try:
         run_res = await session.call_tool(
-            "a0_run", {"prompt": "Ответь одним словом: PONG. Больше ничего не делай."}
+            "a0_run", {"message": "Reply with exactly one word: PONG"}
         )
         struct = getattr(run_res, "structuredContent", None) or {}
         ctx = struct.get("context_id")
+        resp = struct.get("response")
         if not ctx:
             print(f"  {_c(False)} a0_run не вернул context_id: {_result_text(run_res)}")
             return 1
-        print(f"  {_c(True)} a0_run → context_id={ctx}")
+        print(f"  {_c(True)} a0_run → context_id={ctx}  response={resp!r}")
 
-        wait_res = await session.call_tool("a0_wait", {"context_id": ctx, "timeout": 120})
-        print(f"  {_c(True)} a0_wait → {_result_text(wait_res)}")
+        log_res = await session.call_tool("a0_log_tail", {"context_id": ctx, "length": 5})
+        print(f"  {_c(True)} a0_log_tail → {_result_text(log_res)}")
 
         await session.call_tool("a0_terminate", {"context_id": ctx})
-        print(f"  {_c(True)} a0_terminate → контекст очищен")
+        print(f"  {_c(True)} a0_terminate → чат удалён")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"  {_c(False)} full roundtrip упал: {e}")
