@@ -21,6 +21,7 @@ import time
 from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from .adapters import BaseAdapter, make_adapter
@@ -28,6 +29,19 @@ from .client import A0Client, A0HTTPError
 from .config import settings
 
 log = logging.getLogger(__name__)
+
+
+def _csv(raw: str) -> list[str]:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+# DNS-rebinding защита MCP-транспорта. Если выключена — Host/Origin не валидируются
+# (нужно для доступа по LAN-адресу, иначе SDK отдаёт 421 Misdirected Request).
+_transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=settings.mcp_dns_rebinding_protection,
+    allowed_hosts=_csv(settings.mcp_allowed_hosts),
+    allowed_origins=_csv(settings.mcp_allowed_origins),
+)
 
 mcp = FastMCP(
     name="a0-mcp",
@@ -39,6 +53,7 @@ mcp = FastMCP(
         "preset to switch model configuration. Use a0_schedule for recurring (cron) or one-off "
         "background tasks."
     ),
+    transport_security=_transport_security,
 )
 
 

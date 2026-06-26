@@ -36,6 +36,17 @@ class Settings(BaseSettings):
         default="",
         description="Опциональный Bearer token для входящих запросов от Claude Code",
     )
+    # DNS-rebinding защита MCP-транспорта. По умолчанию выключена: сервер headless,
+    # доступ ограничивается MCP_AUTH_TOKEN, а защита иначе режет доступ по LAN-адресу (421).
+    mcp_dns_rebinding_protection: bool = Field(default=False)
+    mcp_allowed_hosts: str = Field(
+        default="",
+        description="CSV разрешённых Host (вкл. порт), если protection включён. '*' — любой.",
+    )
+    mcp_allowed_origins: str = Field(
+        default="",
+        description="CSV разрешённых Origin, если protection включён.",
+    )
 
     log_level: str = Field(default="INFO")
 
