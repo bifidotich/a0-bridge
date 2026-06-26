@@ -1,177 +1,103 @@
 # a0-mcp
 
-MCP-сервер, оборачивающий Agent Zero так, чтобы Claude Code мог делегировать ему задачи как субагенту.
-
-## Зачем
-
-Claude Code — отличный планировщик и исследователь, но дорого тратит контекст на грязную работу: рутинные скрипты, поиск по большим репозиториям, прогон тестов, парсинг страниц. Agent Zero делает это дёшево и в собственной изолированной Linux-среде. Этот пакет связывает их через MCP, и Claude Code видит Agent Zero как набор обычных инструментов.
+MCP-сервер (streamable HTTP), проксирующий external REST API Agent Zero в набор MCP-инструментов. Claude Code делегирует задачи Agent Zero как субагенту; A0 исполняет их в изолированной Linux-среде и рекурсивно спавнит свои subordinate-агенты.
 
 ```
-Claude Code  ──tool_use──▶  a0-mcp (HTTP/MCP)  ──REST──▶  Agent Zero (Docker)
-                                                                │
-                                                                ▼
-                                                  subordinate agents inside A0
+Claude Code ──tool_use──▶ a0-mcp (FastMCP/HTTP) ──REST/X-API-KEY──▶ Agent Zero
 ```
 
-Получается двухуровневая иерархия: Claude Code порождает субагентов A0 параллельными `tool_use`, а сам A0 внутри ещё спавнит свои subordinate-агенты.
+## Версии
 
-## Поддерживаемые версии Agent Zero
+| A0_VERSION | Версии A0 | Docker image       |
+|------------|-----------|--------------------|
+| `v1`       | 1.2–1.20  | `frdel/agent-zero` |
+| `v2`       | 2.0+      | `agent0ai/agent-zero` |
 
-| Версия | Docker image | A0_VERSION |
-|--------|--------------|------------|
-| v1.2 — v1.20 | `frdel/agent-zero:latest` | `v1` |
-| v2.0+ | `agent0ai/agent-zero:latest` | `v2` |
+Выбор версии явный (`A0_VERSION`), автоопределения нет. `V2Adapter` наследует `V1Adapter`, переопределяя только различающиеся endpoint'ы (health/projects/presets).
 
-Версия задаётся явно в `.env` — мы не делаем автоопределение, чтобы избежать ложных переключений.
-
-## Быстрый старт
-
-### 1. Получить API ключ Agent Zero
-
-В Web UI Agent Zero: `Settings → External Services → API Keys` → создать ключ.
-
-### 2. Скопировать `.env`
+## Запуск
 
 ```bash
-cp .env.example .env
-# отредактировать: A0_URL, A0_API_KEY, A0_VERSION
+cp .env.example .env          # A0_URL, A0_API_KEY (Settings → External Services → API Keys), A0_VERSION
+docker compose up -d --build  # agent-zero :50080 (WebUI), a0-mcp :8765/mcp
 ```
 
-### 3. Запустить через docker-compose
-
-```bash
-docker compose up -d --build
-```
-
-Поднимутся два контейнера:
-- `agent-zero` на `http://localhost:50080` (Web UI)
-- `a0-mcp` на `http://localhost:8765/mcp` (MCP endpoint)
-
-### 4. Подключить к Claude Code
-
-```bash
-claude mcp add --transport http a0 http://localhost:8765/mcp
-```
-
-Если включена авторизация (`MCP_AUTH_TOKEN` задан):
+Подключение к Claude Code:
 
 ```bash
 claude mcp add --transport http a0 http://localhost:8765/mcp \
-  --header "Authorization: Bearer your-token"
+  [--header "Authorization: Bearer $MCP_AUTH_TOKEN"]   # header нужен, если MCP_AUTH_TOKEN задан
 ```
 
-Проверка:
+## Инструменты
 
-```bash
-claude mcp list
-```
+| Tool | Сигнатура → результат |
+|------|------------------------|
+| `a0_health` | `()` → версия/связность |
+| `a0_run` | `(prompt, project_id?, preset?, context_id?)` → `context_id` (async, не блокирует) |
+| `a0_wait` | `(context_id, timeout?)` → финальный ответ; стримит прогресс (см. ниже) |
+| `a0_status` | `(context_id)` → `running`/`done` без блокировки |
+| `a0_log_tail` | `(context_id, length=20)` → последние N записей лога |
+| `a0_projects` / `a0_presets` | `()` → список проектов / model presets |
+| `a0_schedule` | `(action, …)` → CRUD задач планировщика |
+| `a0_reset` / `a0_terminate` | `(context_id)` → сброс истории / удаление контекста |
 
-Внутри Claude Code:
+`project_id` изолирует workspace/memory/secrets, `preset` переключает model setup. Без них — дефолты (`A0_DEFAULT_PROJECT`).
 
-```
-/mcp
-```
+### Параллелизм
 
-— должно показать `a0` как `connected` с набором инструментов.
-
-## Доступные инструменты
-
-| Инструмент | Что делает |
-|-----------|------------|
-| `a0_health` | Проверить связь с Agent Zero |
-| `a0_run` | Запустить задачу, вернуть `context_id` мгновенно (не ждёт) |
-| `a0_wait` | Дождаться завершения задачи и получить ответ (стримит прогресс) |
-| `a0_status` | Узнать статус без блокировки |
-| `a0_log_tail` | Последние N строк лога (для отладки) |
-| `a0_projects` | Список проектов A0 |
-| `a0_presets` | Список model presets |
-| `a0_schedule` | Cron/разовые задачи планировщика (create/list/run/delete) |
-| `a0_reset` | Сбросить историю чата |
-| `a0_terminate` | Остановить и удалить чат |
+Каждый `context_id` — изолированный субагент. Типовой паттерн: несколько `a0_run` в одном ответе → `a0_wait` по каждому → агрегация.
 
 ### Стриминг прогресса
 
-`a0_wait` не просто блокируется до конца — пока субагент работает, он пушит в Claude Code
-progress-notifications (доля прошедшего времени) и каждую новую запись лога субагента как
-log-сообщение. В UI Claude Code это видно как живой прогресс выполнения, а не «висящий» вызов.
+`a0_wait` поллит `api_log_get` с интервалом `A0_WAIT_POLL_INTERVAL` и ретранслирует в Claude Code MCP-нотификации: `report_progress` (доля от `timeout`) + `info` на каждую новую запись лога субагента. Это не нативный SSE A0 — гранулярность ограничена интервалом поллинга.
 
-### Планировщик (`a0_schedule`)
+### Планировщик
 
-```
-a0_schedule(action="create", name="nightly-tests",
-            prompt="прогони pytest и пришли отчёт", schedule="0 3 * * *")
+```python
+a0_schedule(action="create", name="nightly", prompt="...", schedule="0 3 * * *")  # crontab: m h dom mon dow
+a0_schedule(action="create", name="adhoc", prompt="...", task_type="adhoc")        # разовая, запуск вручную
 a0_schedule(action="list")
-a0_schedule(action="run", task_id="...")     # запустить немедленно
+a0_schedule(action="run",    task_id="...")
 a0_schedule(action="delete", task_id="...")
 ```
 
-`schedule` — обычный crontab из 5 полей `<m> <h> <dom> <mon> <dow>`. Для разовой задачи,
-запускаемой вручную, используйте `task_type="adhoc"` без `schedule`.
+## Конфигурация (`.env`)
 
-## Проверка после запуска
+`A0_URL`, `A0_API_KEY`, `A0_VERSION`, `A0_DEFAULT_PROJECT`, `A0_HTTP_TIMEOUT`, `A0_WAIT_TIMEOUT`, `A0_WAIT_POLL_INTERVAL`, `MCP_HOST`, `MCP_PORT`, `MCP_AUTH_TOKEN`, `LOG_LEVEL`. См. [.env.example](.env.example).
 
-```bash
-python test_connection.py           # пингует все инструменты (read-only)
-python test_connection.py --full    # + реальный a0_run -> a0_wait
-python test_connection.py --url http://localhost:8765/mcp --token <bearer>
-```
-
-Скрипт подключается к серверу как настоящий MCP-клиент, сверяет список инструментов с
-ожидаемым и дёргает безопасные вызовы. Код выхода `0` — мост в порядке.
-
-## Параллельная субагентность
-
-Главный сценарий — Claude Code в одном ответе делает несколько `a0_run` и затем собирает результаты:
-
-```
-1. a0_run("проанализируй package.json и список deps")   → ctx_A
-2. a0_run("прогони pytest, верни количество failed")    → ctx_B
-3. a0_run("найди все TODO в src/, верни путь:строка")   → ctx_C
-4. a0_wait(ctx_A); a0_wait(ctx_B); a0_wait(ctx_C)       → агрегация
-```
-
-Каждый `context_id` — это изолированный субагент со своей памятью.
-
-## Проекты и presets
-
-```
-a0_run(prompt="...", project_id="frontend-v3", preset="fast")
-```
-
-`project_id` изолирует workspace/memory/secrets, `preset` переключает model setup (быстрый/дешёвый/локальный). Если не передавать — будут default'ы.
-
-## Локальная разработка
+## Разработка и проверка
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && . .venv/Scripts/activate   # POSIX: . .venv/bin/activate
 pip install -e .
-cp .env.example .env  # выставить A0_URL и A0_API_KEY
-a0-mcp
+a0-mcp                                             # = python -m a0_mcp
+
+python test_connection.py [--full] [--url URL] [--token T]
 ```
+
+`test_connection.py` подключается как MCP-клиент, сверяет набор инструментов и пингует read-only вызовы (`--full` добавляет реальный `a0_run → a0_wait → a0_terminate`). Exit `0` — мост в порядке.
 
 ## Архитектура
 
 ```
 src/a0_mcp/
-├── config.py       — pydantic-settings, всё из .env
-├── client.py       — async httpx обёртка, X-API-KEY auth
+├── config.py            pydantic-settings (.env)
+├── client.py            async httpx, X-API-KEY, обработка ошибок → A0HTTPError
 ├── adapters/
-│   ├── base.py     — абстрактный интерфейс
-│   ├── v1.py       — Agent Zero v1.2-v1.20
-│   └── v2.py       — Agent Zero v2.0+ (наследуется от v1)
-├── server.py       — FastMCP, регистрация tools, polling логики
-└── __main__.py     — entry point streamable HTTP
+│   ├── base.py          ABC: send_message/get_log/reset/terminate/projects/presets/scheduler
+│   ├── v1.py            A0 1.2–1.20 + crontab-парсер + перебор scheduler-endpoint'ов
+│   └── v2.py            A0 2.0+, override health/projects/presets
+├── server.py            FastMCP: регистрация tools, poll-loop, стриминг через Context
+└── __main__.py          entry point (streamable HTTP + опц. Bearer-middleware)
 ```
 
-Адаптер изолирует знания о различиях версий. Добавить поддержку v3.x в будущем — это новый файл в `adapters/`.
+Поддержка новой мажорной версии = новый адаптер в `adapters/` + ветка в `make_adapter`.
 
-## Известные ограничения MVP
+## Ограничения
 
-- Прогресс собирается polling'ом лога A0 и ретранслируется в Claude Code как progress/log
-  notifications. Это не нативный SSE-поток от A0 — гранулярность ограничена `A0_WAIT_POLL_INTERVAL`.
-- `a0_schedule`, `list_projects`, `list_presets` пробуют несколько вариантов endpoint'ов,
-  потому что их имена менялись между минорными релизами Agent Zero. При пустом результате
-  используйте `project_id` напрямую как строку из WebUI, а задачи планировщика — через A0 WebUI.
+- Прогресс — поллинг, не SSE (гранулярность = `A0_WAIT_POLL_INTERVAL`).
+- `a0_schedule`/`list_projects`/`list_presets` перебирают несколько вариантов путей (имена endpoint'ов A0 менялись между релизами); при пустом ответе оперируйте `project_id` как строкой и планировщиком через WebUI.
 
 ## Лицензия
 
