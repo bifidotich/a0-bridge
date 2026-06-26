@@ -44,6 +44,8 @@ except ImportError:  # pragma: no cover
 EXPECTED_TOOLS = {
     "a0_health",
     "a0_run",
+    "a0_result",
+    "a0_jobs",
     "a0_log_tail",
     "a0_reset",
     "a0_terminate",
@@ -150,7 +152,31 @@ async def _full_roundtrip(session: ClientSession) -> int:
 
         await session.call_tool("a0_terminate", {"context_id": ctx})
         print(f"  {_c(True)} a0_terminate → чат удалён")
-        return 0
+
+        # --- async job-режим: a0_run(wait=False) -> poll a0_result ---
+        job_res = await session.call_tool(
+            "a0_run", {"message": "Reply with exactly one word: PONG", "wait": False}
+        )
+        job = (getattr(job_res, "structuredContent", None) or {}).get("job_id")
+        if not job:
+            print(f"  {_c(False)} a0_run(wait=False) не вернул job_id: {_result_text(job_res)}")
+            return 1
+        print(f"  {_c(True)} a0_run(wait=False) → job_id={job}")
+
+        import asyncio
+
+        for _ in range(60):
+            res = await session.call_tool("a0_result", {"job_id": job})
+            struct = getattr(res, "structuredContent", None) or {}
+            if struct.get("status") in ("done", "error"):
+                break
+            await asyncio.sleep(2)
+        ok = struct.get("status") == "done"
+        print(f"  {_c(ok)} a0_result → status={struct.get('status')} response={struct.get('response')!r}")
+        if struct.get("context_id"):
+            await session.call_tool("a0_terminate", {"context_id": struct["context_id"]})
+            print(f"  {_c(True)} a0_terminate (job) → чат удалён")
+        return 0 if ok else 1
     except Exception as e:  # noqa: BLE001
         print(f"  {_c(False)} full roundtrip упал: {e}")
         return 1

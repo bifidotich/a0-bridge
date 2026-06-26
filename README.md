@@ -41,7 +41,9 @@ claude mcp add --transport http a0 http://localhost:8765/mcp \
 | Tool | Сигнатура → результат |
 |------|------------------------|
 | `a0_health` | `()` → связность + валидность ключа |
-| `a0_run` | `(message, context_id?, project_name?, lifetime_hours?)` → `{context_id, response}` |
+| `a0_run` | `(message, context_id?, project_name?, attachments?, lifetime_hours?, wait=True)` → `{context_id, response}` или `{job_id}` |
+| `a0_result` | `(job_id)` → статус/результат фоновой задачи (`running`/`done`/`error`) |
+| `a0_jobs` | `()` → список фоновых задач |
 | `a0_log_tail` | `(context_id, length=20)` → последние N записей лога |
 | `a0_reset` | `(context_id)` → сброс истории (context_id жив) |
 | `a0_terminate` | `(context_id)` → удалить чат |
@@ -49,7 +51,12 @@ claude mcp add --transport http a0 http://localhost:8765/mcp \
 
 - `context_id` из ответа `a0_run` передавайте в следующий `a0_run`, чтобы продолжить тот же чат.
 - `project_name` изолирует workspace/memory и активируется только на первом сообщении (без `context_id`). Дефолт — `A0_DEFAULT_PROJECT`.
+- `attachments` — файлы субагенту: список `{filename, base64}`.
 - Параллелизм: несколько `a0_run` в одном ответе = несколько изолированных субагентов.
+
+### Синхронно vs job-режим
+
+`a0_run` синхронный по умолчанию (`wait=True`): держит вызов, пока субагент не ответит. Для долгих задач используйте `wait=False` — мост запускает задачу в фоне и сразу возвращает `job_id`, не держа MCP-соединение; результат забираете через `a0_result(job_id)` (или смотрите все задачи через `a0_jobs`). Фоновые задачи живут в памяти моста ~1 час после завершения.
 
 ## Конфигурация (`.env`)
 

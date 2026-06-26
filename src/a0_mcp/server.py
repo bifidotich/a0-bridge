@@ -15,7 +15,11 @@ API синхронный: a0_run отправляет сообщение и ср
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -26,6 +30,9 @@ from .client import A0Client
 from .config import settings
 
 log = logging.getLogger(__name__)
+
+# Сколько держать завершённые job'ы в памяти, прежде чем выгрести (сек).
+_JOB_TTL = 3600.0
 
 
 def _csv(raw: str) -> list[str]:
@@ -67,6 +74,63 @@ def _resolve_project(project_name: str | None) -> str | None:
     return project_name or (settings.a0_default_project or None)
 
 
+# --- Job registry для async-режима a0_run(wait=False) ---
+
+
+@dataclass
+class _Job:
+    id: str
+    message: str
+    status: str = "running"  # running | done | error
+    started: float = field(default_factory=time.monotonic)
+    finished: float | None = None
+    context_id: str | None = None
+    response: str | None = None
+    error: str | None = None
+    task: asyncio.Task | None = None  # держим ссылку, чтобы задачу не собрал GC
+
+
+_jobs: dict[str, _Job] = {}
+
+
+def _prune_jobs() -> None:
+    """Выгрести завершённые job'ы старше _JOB_TTL, чтобы реестр не рос бесконечно."""
+    now = time.monotonic()
+    stale = [
+        jid
+        for jid, j in _jobs.items()
+        if j.finished is not None and (now - j.finished) > _JOB_TTL
+    ]
+    for jid in stale:
+        _jobs.pop(jid, None)
+
+
+async def _run_job(job: _Job, **kwargs: Any) -> None:
+    """Фоновое выполнение синхронного api_message. Результат складываем в job."""
+    try:
+        resp = await _client_ref().send_message(job.message, **kwargs)
+        job.context_id = _extract_context_id(resp)
+        job.response = _extract_response(resp)
+        job.status = "done"
+    except Exception as e:  # noqa: BLE001 — любую ошибку отдаём через job.error
+        job.status = "error"
+        job.error = str(e)
+    finally:
+        job.finished = time.monotonic()
+
+
+def _job_view(job: _Job) -> dict[str, Any]:
+    out: dict[str, Any] = {"job_id": job.id, "status": job.status}
+    if job.status == "done":
+        out["context_id"] = job.context_id
+        out["response"] = job.response
+    elif job.status == "error":
+        out["error"] = job.error
+    else:
+        out["elapsed"] = round(time.monotonic() - job.started, 1)
+    return out
+
+
 def _extract_context_id(resp: dict[str, Any]) -> str | None:
     for key in ("context_id", "context", "ctx_id", "chat_id"):
         if resp.get(key):
@@ -103,28 +167,69 @@ async def a0_run(
         str | None,
         Field(default=None, description="Проект A0 (workspace/memory). Активируется только на первом сообщении."),
     ] = None,
+    attachments: Annotated[
+        list[dict[str, str]] | None,
+        Field(default=None, description="Файлы субагенту: список {filename, base64}."),
+    ] = None,
     lifetime_hours: Annotated[
         float | None,
         Field(default=None, description="Время жизни чата в часах (по умолчанию из конфига)."),
     ] = None,
+    wait: Annotated[
+        bool,
+        Field(default=True, description="True — ждать ответ (синхронно). False — вернуть job_id сразу."),
+    ] = True,
 ) -> dict[str, Any]:
-    """Отправить задачу субагенту Agent Zero и синхронно получить финальный ответ.
+    """Отправить задачу субагенту Agent Zero.
 
-    API блокирующий: возврат происходит, когда субагент закончил. Для параллельной работы
-    делайте несколько вызовов a0_run в одном ответе — каждый создаёт изолированный субагент.
+    wait=True (по умолчанию): блокирующий вызов, сразу возвращает {context_id, response}.
+    wait=False: запускает задачу в фоне моста и мгновенно возвращает {job_id}; забирайте
+    результат через a0_result(job_id). Удобно для долгих задач (не держит MCP-соединение)
+    и для запуска нескольких субагентов без ожидания.
+
     Сохраните context_id из ответа, чтобы продолжить тот же чат следующим a0_run.
     """
-    resp = await _client_ref().send_message(
-        message,
-        context_id=context_id,
-        project_name=_resolve_project(project_name),
-        lifetime_hours=lifetime_hours,
-    )
-    return {
-        "context_id": _extract_context_id(resp) or context_id,
-        "response": _extract_response(resp),
-        "raw": resp,
+    kwargs: dict[str, Any] = {
+        "context_id": context_id,
+        "project_name": _resolve_project(project_name),
+        "attachments": attachments,
+        "lifetime_hours": lifetime_hours,
     }
+
+    if wait:
+        resp = await _client_ref().send_message(message, **kwargs)
+        return {
+            "context_id": _extract_context_id(resp) or context_id,
+            "response": _extract_response(resp),
+            "raw": resp,
+        }
+
+    _prune_jobs()
+    job = _Job(id=uuid.uuid4().hex[:12], message=message)
+    job.task = asyncio.create_task(_run_job(job, **kwargs))
+    _jobs[job.id] = job
+    return {"job_id": job.id, "status": "running"}
+
+
+@mcp.tool()
+async def a0_result(
+    job_id: Annotated[str, Field(description="job_id из a0_run(wait=False)")],
+) -> dict[str, Any]:
+    """Забрать состояние/результат фоновой задачи a0_run. Не блокирует.
+
+    status: running — ещё считается; done — готово ({context_id, response});
+    error — упало ({error}).
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        raise ValueError(f"Неизвестный job_id: {job_id} (истёк или не существовал)")
+    return _job_view(job)
+
+
+@mcp.tool()
+async def a0_jobs() -> dict[str, Any]:
+    """Список всех фоновых задач моста и их статусов."""
+    return {"jobs": [_job_view(j) for j in _jobs.values()]}
 
 
 @mcp.tool()
