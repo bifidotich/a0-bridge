@@ -7,8 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Сначала только метаданные — кэш слой зависимостей
-COPY pyproject.toml ./
+# Сначала только метаданные — кэш слой зависимостей.
+# README.md обязателен: pyproject объявляет readme = "README.md", hatchling читает его при сборке.
+COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN pip install --no-cache-dir .
