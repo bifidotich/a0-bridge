@@ -1,0 +1,40 @@
+services:
+  # --- Agent Zero ---
+  # По умолчанию v2.0. Для v1.x замените image на frdel/agent-zero:latest
+  # и в .env поставьте A0_VERSION=v1
+  agent-zero:
+    image: agent0ai/agent-zero:latest
+    container_name: a0
+    restart: unless-stopped
+    ports:
+      - "50080:80"   # доступ к WebUI с хоста: http://localhost:50080
+    volumes:
+      - a0_usr:/a0/usr   # ВАЖНО: только /a0/usr, не весь /a0 (это рекомендация Agent Zero)
+    environment:
+      - TZ=Europe/Amsterdam
+    networks:
+      - a0net
+
+  # --- наш MCP-сервер ---
+  a0-mcp:
+    build: .
+    container_name: a0-mcp
+    restart: unless-stopped
+    depends_on:
+      - agent-zero
+    ports:
+      - "8765:8765"  # MCP endpoint: http://localhost:8765/mcp
+    env_file:
+      - .env
+    environment:
+      # Внутри docker network достаём по имени сервиса
+      - A0_URL=http://agent-zero:80
+    networks:
+      - a0net
+
+networks:
+  a0net:
+    driver: bridge
+
+volumes:
+  a0_usr:
